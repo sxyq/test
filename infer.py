@@ -1,5 +1,6 @@
 import sys
 import os
+from contextlib import nullcontext
 
 # 获取当前环境脚本所在目录或指定绝对路径
 if os.path.exists("../libraries"):
@@ -16,6 +17,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+
+
+def configure_runtime():
+    """Enable safe CUDA runtime fast paths without changing model semantics."""
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -230,13 +244,13 @@ def make_collate_fn(max_slot_id):
 # 模型定义（来自 main.py）
 # ============================================================
 
-def move_batch_to_device(batch, device):
+def move_batch_to_device(batch, device, non_blocking=False):
     if isinstance(batch, dict):
-        return {k: move_batch_to_device(v, device) for k, v in batch.items()}
+        return {k: move_batch_to_device(v, device, non_blocking=non_blocking) for k, v in batch.items()}
     elif isinstance(batch, (list, tuple)):
-        return [move_batch_to_device(x, device) for x in batch]
+        return [move_batch_to_device(x, device, non_blocking=non_blocking) for x in batch]
     elif torch.is_tensor(batch):
-        return batch.to(device)
+        return batch.to(device, non_blocking=non_blocking)
     else:
         return batch
 
@@ -267,6 +281,19 @@ class RepEncoder(nn.Module):
 
 
 def scaled_dot_product(q, k, v, extension):
+    if hasattr(F, "scaled_dot_product_attention"):
+        attn_mask = None
+        if extension is not None and "mask" in extension:
+            attn_mask = extension["mask"]
+        return F.scaled_dot_product_attention(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+
     d = q.size(-1)
     scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
     if extension is not None and "mask" in extension:
@@ -418,12 +445,17 @@ class CTRModel(nn.Module):
 
     def get_sequence_causal_mask(self, seq_info):
         lengths = seq_info[1:] - seq_info[:-1]
-        lengths = lengths.view(-1)
-        indices = torch.cumsum(torch.ones_like(lengths), dim=0) - 1
-        result = torch.repeat_interleave(indices, lengths)
-        a = result.view(1, -1) - result.view(-1, 1)
-        out_mask = torch.tril((a == 0).to(torch.int32)).bool()
-        return out_mask
+        user_ids = torch.repeat_interleave(
+            torch.arange(lengths.numel(), device=seq_info.device),
+            lengths.view(-1),
+        )
+        same_user = user_ids.view(1, -1).eq(user_ids.view(-1, 1))
+        causal = torch.ones(
+            (user_ids.numel(), user_ids.numel()),
+            device=seq_info.device,
+            dtype=torch.bool,
+        ).tril()
+        return same_user & causal
 
     def forward(self, batch):
         seq_input = self.rep_encoder(batch)
@@ -585,6 +617,8 @@ def main():
     parser.add_argument('--ckpt', type=str, default=None, help='checkpoint 文件路径，默认使用同目录下的 ckpt.pt')
     args = parser.parse_args()
 
+    configure_runtime()
+
     cur_path = Path(__file__).parent.absolute()
     ref_dir = cur_path / 'dataset'
     history_dir = ref_dir / 'history'
@@ -674,10 +708,16 @@ def main():
     all_logids = []
     all_probs = []
     time_sum = 0.0
+    use_cuda = dev.type == "cuda"
+    autocast_ctx = (
+        torch.cuda.amp.autocast(dtype=torch.float16)
+        if use_cuda and hasattr(torch.cuda, "amp")
+        else nullcontext()
+    )
 
-    with torch.no_grad():
+    with torch.inference_mode(), autocast_ctx:
         for batch in tqdm(all_batches, desc="Inference"):
-            batch = move_batch_to_device(batch, dev)
+            batch = move_batch_to_device(batch, dev, non_blocking=use_cuda)
             pred_mask = batch["pred_mask"].bool()
 
             t_start = time.time()
