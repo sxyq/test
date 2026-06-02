@@ -1,0 +1,24 @@
+# 大文件 - 不提交到 git
+dataset/
+weights/
+ckpt.pt
+*.tar
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# 系统文件
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
+
+# 推理输出
+predict.txt
