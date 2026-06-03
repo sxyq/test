@@ -198,6 +198,28 @@ class CTRUserDataset(Dataset):
         }
 
 
+class CTRTestSeqDataset(CTRUserDataset):
+    """Compatibility wrapper for the evaluator's expected dataset class name/signature."""
+
+    def __init__(
+        self,
+        test_logids_ordered,
+        item_dict,
+        user_seq,
+        max_feasign_per_slot=None,
+        max_ctx_len=None,
+    ):
+        pred_logids = set(test_logids_ordered)
+        super().__init__(
+            item_dict=item_dict,
+            user_seq=user_seq,
+            max_feasign_per_slot=max_feasign_per_slot,
+            pred_logids=pred_logids,
+        )
+        self.test_logids_ordered = list(test_logids_ordered)
+        self.max_ctx_len = max_ctx_len
+
+
 def make_collate_fn(max_slot_id):
     def collate_user_batch(batch):
         all_userids = []
@@ -477,7 +499,7 @@ class CTRModel(nn.Module):
 # 模型加载入口
 # ============================================================
 
-def load_model(device='cuda:0', ckpt_path=None):
+def load_model(ckpt_path=None, device='cuda:0'):
     """加载模型并返回，供 evaluation.py 调用。
 
     Args:
