@@ -3,9 +3,11 @@ import os
 from contextlib import nullcontext
 
 # 获取当前环境脚本所在目录或指定绝对路径
-if os.path.exists("../libraries"):
-    lib_path = os.path.abspath("../libraries")
-    sys.path.append(lib_path)
+for lib_dir in ("../libraries", "./libraries"):
+    if os.path.exists(lib_dir):
+        lib_path = os.path.abspath(lib_dir)
+        if lib_path not in sys.path:
+            sys.path.append(lib_path)
 
 import math
 import argparse

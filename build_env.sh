@@ -9,14 +9,25 @@ echo "=========================================="
 echo "开始构建环境..."
 echo "=========================================="
 
-# 方式1：使用预编译的tar包（推荐，更快）
-# 下载预编译依赖包
-# wget https://studio-package.bj.bcebos.com/2026-shangye-python-package/external-libraries.tar -O libraries.tar
-# tar -xf libraries.tar --strip-components=1 -C libraries
+# infer.py 会优先从 /home/aistudio/libraries 加载依赖；评测时当前目录通常是 /home/aistudio/code。
+LIB_DIR="../libraries"
+mkdir -p "${LIB_DIR}"
 
-# 方式2：自行安装依赖
-pip install uv
-uv pip install -r requirements.txt --target ./libraries -i https://mirrors.aliyun.com/pypi/simple/
+# 方式1：使用预编译 tar 包，避免在线安装 torch/paddlepaddle-gpu 超时或版本不匹配。
+if [ ! -d "${LIB_DIR}/torch" ]; then
+    if [ ! -f "libraries.tar" ]; then
+        wget https://studio-package.bj.bcebos.com/2026-shangye-python-package/external-libraries.tar -O libraries.tar
+    fi
+    tar -xf libraries.tar --strip-components=1 -C "${LIB_DIR}"
+fi
+
+# 方式2：补齐 requirements 中预编译包未覆盖的轻量依赖。
+if [ -x "${LIB_DIR}/bin/uv" ]; then
+    "${LIB_DIR}/bin/uv" pip install -r requirements.txt --target "${LIB_DIR}" -i https://mirrors.aliyun.com/pypi/simple/ || true
+else
+    pip install uv -i https://mirrors.aliyun.com/pypi/simple/ || true
+    uv pip install -r requirements.txt --target "${LIB_DIR}" -i https://mirrors.aliyun.com/pypi/simple/ || true
+fi
 
 echo "=========================================="
 echo "环境构建完成！"
