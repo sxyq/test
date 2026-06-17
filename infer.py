@@ -34,6 +34,27 @@ def configure_runtime():
         pass
 
 
+def resolve_device(requested_device=None, require_cuda=True):
+    """Resolve runtime device and fail early on unsupported CPU fallback paths."""
+    if requested_device:
+        dev = torch.device(requested_device)
+        if dev.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"Requested CUDA device '{requested_device}', but CUDA is unavailable."
+            )
+        return dev
+
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+
+    if require_cuda:
+        raise RuntimeError(
+            "CUDA is unavailable. This submission is intended for the AI Studio GPU runtime. "
+            "Running the full checkpoint on CPU is a known unstable path and may be killed by the platform."
+        )
+    return torch.device("cpu")
+
+
 # ============================================================
 # 数据加载（来自 train/dataset.py）
 # ============================================================
@@ -378,33 +399,42 @@ class SMoE(nn.Module):
         topk_idx, topk_score, probs = self.gate(x)
 
         out = torch.zeros_like(x)
+        out_flat = out.reshape(-1, D)
+        x_flat = x.reshape(-1, D)
+        token_idx_flat = (
+            torch.arange(B * S, device=x.device)
+            .unsqueeze(1)
+            .expand(-1, self.k)
+            .reshape(-1)
+        )
+        expert_idx_flat = topk_idx.reshape(-1)
+        expert_score_flat = topk_score.reshape(-1, 1)
 
-        # flatten
-        x_flat = x.reshape(-1, D)                # [B*S, D]
-        idx_flat = topk_idx.reshape(-1, self.k)  # [B*S, k]
-        score_flat = topk_score.reshape(-1, self.k)
+        order = torch.argsort(expert_idx_flat)
+        expert_idx_sorted = expert_idx_flat[order]
+        token_idx_sorted = token_idx_flat[order]
+        expert_score_sorted = expert_score_flat[order]
+
+        counts = torch.bincount(expert_idx_sorted, minlength=self.num_experts)
+        starts = torch.cumsum(counts, dim=0) - counts
 
         for i in range(self.num_experts):
-            # 找到被路由到 expert i 的 token
-            mask = (idx_flat == i)  # [B*S, k]
-
-            if not mask.any():
+            count = int(counts[i].item())
+            if count == 0:
                 continue
+            start = int(starts[i].item())
+            end = start + count
+            cur_token_idx = token_idx_sorted[start:end]
+            cur_weight = expert_score_sorted[start:end]
+            selected_x = x_flat.index_select(0, cur_token_idx)
+            expert_out = self.experts[i](selected_x)
+            out_flat.index_add_(0, cur_token_idx, expert_out * cur_weight)
 
-            # 哪些 token 命中了 expert i
-            token_idx, k_idx = mask.nonzero(as_tuple=True)
-
-            selected_x = x_flat[token_idx]  # [N, D]
-
-            expert_out = self.experts[i](selected_x)  # [N, D]
-
-            weight = score_flat[token_idx, k_idx].unsqueeze(-1)
-
-            out_flat = out.reshape(-1, D)
-            out_flat[token_idx] += expert_out * weight
-
-        importance = probs.sum(dim=(0,1))  # [E]
-        moe_loss = (importance.std() / (importance.mean() + 1e-6))
+        if self.training:
+            importance = probs.sum(dim=(0, 1))  # [E]
+            moe_loss = importance.std() / (importance.mean() + 1e-6)
+        else:
+            moe_loss = x.new_zeros(())
 
         return out, moe_loss
 
@@ -433,7 +463,8 @@ class TransformerEncoder(nn.Module):
         ])
 
     def forward(self, x, extension):
-        x = x.unsqueeze(0)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
         B, S, D = x.shape
 
         moe_loss_total = 0.0
@@ -467,29 +498,43 @@ class CTRModel(nn.Module):
         self.d_model = d_model
         self.linear = nn.Linear(d_model, 1)
 
-    def get_sequence_causal_mask(self, seq_info):
-        lengths = seq_info[1:] - seq_info[:-1]
-        user_ids = torch.repeat_interleave(
-            torch.arange(lengths.numel(), device=seq_info.device),
-            lengths.view(-1),
-        )
-        same_user = user_ids.view(1, -1).eq(user_ids.view(-1, 1))
-        causal = torch.ones(
-            (user_ids.numel(), user_ids.numel()),
-            device=seq_info.device,
-            dtype=torch.bool,
-        ).tril()
-        return same_user & causal
+    def pack_user_sequences(self, seq_input, seq_info):
+        lengths = (seq_info[1:] - seq_info[:-1]).to(torch.long)
+        batch_size = int(lengths.numel())
+        max_len = int(lengths.max().item()) if batch_size > 0 else 0
+        total_len, dim = seq_input.shape
+
+        padded = seq_input.new_zeros((batch_size, max_len, dim))
+        valid_mask = torch.zeros((batch_size, max_len), device=seq_input.device, dtype=torch.bool)
+
+        for user_idx in range(batch_size):
+            start = int(seq_info[user_idx].item())
+            end = int(seq_info[user_idx + 1].item())
+            cur_len = end - start
+            if cur_len <= 0:
+                continue
+            padded[user_idx, :cur_len] = seq_input[start:end]
+            valid_mask[user_idx, :cur_len] = True
+
+        return padded, valid_mask
+
+    def get_padded_causal_mask(self, valid_mask):
+        if valid_mask.numel() == 0:
+            return valid_mask.new_zeros((0, 1, 0, 0))
+        seq_len = valid_mask.size(1)
+        causal = torch.ones((seq_len, seq_len), device=valid_mask.device, dtype=torch.bool).tril()
+        pair_mask = valid_mask.unsqueeze(-1) & valid_mask.unsqueeze(-2)
+        return (pair_mask & causal.unsqueeze(0)).unsqueeze(1)
 
     def forward(self, batch):
         seq_input = self.rep_encoder(batch)
-        seq_mask = self.get_sequence_causal_mask(batch["user_offsets"])
+        padded_seq_input, valid_mask = self.pack_user_sequences(seq_input, batch["user_offsets"])
+        seq_mask = self.get_padded_causal_mask(valid_mask)
         encoder_output, moe_loss = self.seq_encoder(
-            x=seq_input,
-            extension={"mask": seq_mask.unsqueeze(0).unsqueeze(0)},
+            x=padded_seq_input,
+            extension={"mask": seq_mask},
         )
-        encoder_output_dim = encoder_output.shape[-1]
-        encoder_output = encoder_output.reshape(1, -1, encoder_output_dim).squeeze(0)
+        encoder_output = encoder_output[valid_mask]
         pred = self.linear(encoder_output)
         pred_logits = torch.clamp(pred, min=-15.0, max=15.0)
         return pred_logits, moe_loss
@@ -533,7 +578,7 @@ def load_model(ckpt_path=None, device='cuda:0'):
     )
     model = CTRModel(rep_encoder, seq_encoder, d_model=d_model)
 
-    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    dev = resolve_device(device, require_cuda=False)
 
     # 加载 checkpoint
     # 若需要加载自定义修改的权重，请修改 479-488行逻辑，强制使用你文件夹中的权重
@@ -543,9 +588,36 @@ def load_model(ckpt_path=None, device='cuda:0'):
     else:
         ckpt_path = Path(ckpt_path)
     if ckpt_path.exists():
-        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-        model.load_state_dict(ckpt['model_state_dict'])
-        print(f"[INFO] Loaded checkpoint from {ckpt_path} (epoch={ckpt.get('epoch', '?')})")
+        import gc
+        import inspect
+
+        load_kwargs = {
+            'map_location': 'cpu',
+            'weights_only': False,
+        }
+        try:
+            if 'mmap' in inspect.signature(torch.load).parameters:
+                load_kwargs['mmap'] = True
+        except (TypeError, ValueError):
+            pass
+
+        print(f"[INFO] Loading checkpoint from {ckpt_path}")
+        ckpt = torch.load(ckpt_path, **load_kwargs)
+        state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) else ckpt
+        epoch = ckpt.get('epoch', '?') if isinstance(ckpt, dict) else '?'
+
+        try:
+            if 'assign' in inspect.signature(model.load_state_dict).parameters:
+                model.load_state_dict(state_dict, assign=True)
+            else:
+                model.load_state_dict(state_dict)
+        except (TypeError, ValueError):
+            model.load_state_dict(state_dict)
+
+        del state_dict
+        del ckpt
+        gc.collect()
+        print(f"[INFO] Loaded checkpoint from {ckpt_path} (epoch={epoch})")
     else:
         print(f"[WARNING] Checkpoint {ckpt_path} not found, using random weights")
 
@@ -633,15 +705,17 @@ def _cal_score(predict_file, label_file, default_latency=0.0):
 # ============================================================
 
 def main():
-    import io
     import time
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt', type=str, default=None, help='checkpoint 文件路径，默认使用同目录下的 ckpt.pt')
+    parser.add_argument('--device', type=str, default=None, help='推理设备，默认自动选择 cuda:0')
+    parser.add_argument('--allow-cpu', action='store_true', help='允许在无 CUDA 环境下退回 CPU（已知不稳定，仅调试用）')
     args = parser.parse_args()
 
     configure_runtime()
+    runtime_device = resolve_device(args.device, require_cuda=not args.allow_cpu)
 
     cur_path = Path(__file__).parent.absolute()
     ref_dir = cur_path / 'dataset'
@@ -651,19 +725,17 @@ def main():
     label_file = ref_dir / 'label_data.txt'
 
     # ----- 数据加载，优先从缓存读取 -----
-    MAX_SHARD_BYTES = 2 * 1024 * 1024 * 1024  # 2GB per shard
     batches_cache_dir = ref_dir / 'cached_batches'
+    shard_files = []
+    test_loader = None
 
     if batches_cache_dir.exists() and any(batches_cache_dir.glob('shard_*.pt')):
         print(f'[INFO] loading cached batch shards from {batches_cache_dir}')
-        all_batches = []
-        shard_files = sorted(batches_cache_dir.glob('shard_*.pt'),
-                             key=lambda p: int(p.stem.split('_')[1]))
-        for sf in shard_files:
-            shard_batches = torch.load(sf, weights_only=False)
-            all_batches.extend(shard_batches)
-            print(f'[INFO] loaded {len(shard_batches)} batches from {sf.name}')
-        print(f'[INFO] loaded {len(all_batches)} cached batches total from {len(shard_files)} shards')
+        shard_files = sorted(
+            batches_cache_dir.glob('shard_*.pt'),
+            key=lambda p: int(p.stem.split('_')[1]),
+        )
+        print(f'[INFO] found {len(shard_files)} cached batch shards')
     else:
         print('[INFO] start loading data from CSV')
         history_files = sorted(history_dir.glob('*.csv')) if history_dir.exists() else []
@@ -691,41 +763,12 @@ def main():
             num_workers=0,
             collate_fn=make_collate_fn(test_dataset.max_slot_id),
         )
-
-        # 收集 batches 并按分片缓存
-        print('[INFO] collecting batches and saving sharded cache...')
-        all_batches = [batch for batch in test_loader]
-
-        batches_cache_dir.mkdir(parents=True, exist_ok=True)
-        shard_idx = 0
-        current_shard = []
-        current_size = 0
-        for batch in all_batches:
-            buf = io.BytesIO()
-            torch.save(batch, buf)
-            batch_size_bytes = buf.tell()
-            if current_shard and current_size + batch_size_bytes > MAX_SHARD_BYTES:
-                shard_path = batches_cache_dir / f'shard_{shard_idx:04d}.pt'
-                torch.save(current_shard, shard_path)
-                print(f'[INFO] saved shard {shard_path.name}: {len(current_shard)} batches, '
-                      f'~{current_size / 1024**3:.2f}GB')
-                shard_idx += 1
-                current_shard = []
-                current_size = 0
-            current_shard.append(batch)
-            current_size += batch_size_bytes
-        if current_shard:
-            shard_path = batches_cache_dir / f'shard_{shard_idx:04d}.pt'
-            torch.save(current_shard, shard_path)
-            print(f'[INFO] saved shard {shard_path.name}: {len(current_shard)} batches, '
-                  f'~{current_size / 1024**3:.2f}GB')
-            shard_idx += 1
-        print(f'[INFO] saved {len(all_batches)} batches to {shard_idx} shards in {batches_cache_dir}')
+        print('[INFO] using streaming DataLoader batches (no on-disk cache)')
 
     print('[INFO] data loading done')
 
     # ----- 加载模型 -----
-    model, dev = load_model(ckpt_path=args.ckpt)
+    model, dev = load_model(ckpt_path=args.ckpt, device=str(runtime_device))
 
     # ----- 推理 -----
     print('*' * 20 + ' start inference ' + '*' * 20)
@@ -739,21 +782,36 @@ def main():
         else nullcontext()
     )
 
+    def run_one_batch(batch):
+        nonlocal time_sum
+        batch = move_batch_to_device(batch, dev, non_blocking=use_cuda)
+        pred_mask = batch["pred_mask"].bool()
+
+        t_start = time.time()
+        logits, moe_loss = model(batch)
+        logits = logits.squeeze(-1)
+        probs = torch.sigmoid(logits)
+        time_sum += time.time() - t_start
+
+        masked_logids = batch["logid"][pred_mask].cpu().tolist()
+        masked_probs = probs[pred_mask].cpu().tolist()
+        all_logids.extend(masked_logids)
+        all_probs.extend(masked_probs)
+
     with torch.inference_mode(), autocast_ctx:
-        for batch in tqdm(all_batches, desc="Inference"):
-            batch = move_batch_to_device(batch, dev, non_blocking=use_cuda)
-            pred_mask = batch["pred_mask"].bool()
-
-            t_start = time.time()
-            logits, moe_loss = model(batch)
-            logits = logits.squeeze(-1)
-            probs = torch.sigmoid(logits)
-            time_sum += time.time() - t_start
-
-            masked_logids = batch["logid"][pred_mask].cpu().tolist()
-            masked_probs = probs[pred_mask].cpu().tolist()
-            all_logids.extend(masked_logids)
-            all_probs.extend(masked_probs)
+        if shard_files:
+            for sf in shard_files:
+                shard_batches = torch.load(sf, map_location='cpu', weights_only=False)
+                print(f'[INFO] loaded {len(shard_batches)} batches from {sf.name}')
+                for batch in tqdm(shard_batches, desc=f"Inference {sf.name}", leave=False):
+                    run_one_batch(batch)
+                del shard_batches
+                if use_cuda:
+                    torch.cuda.empty_cache()
+            print(f'[INFO] inference consumed {len(shard_files)} cached shards')
+        else:
+            for batch in tqdm(test_loader, desc="Inference"):
+                run_one_batch(batch)
 
     print(f'[INFO] inference time: {round(time_sum, 4)}s')
     print('*' * 20 + ' end inference ' + '*' * 20)

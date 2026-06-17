@@ -22,3 +22,5 @@ __pycache__/
 
 # 推理输出
 predict.txt
+
+.venv_shorttest/
