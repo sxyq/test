@@ -117,6 +117,7 @@ Baidu GRAB/
 | **Sparse Batched SMoE** | V132 | 48.35s | 67.74 | - | - | 只算top-2 expert，与Dense持平，dispatch开销抵消计算节省 |
 | **安装flash-attn** | V139 | 45.90s | 68.33 | 1.059 | 0.752 | ✅ **当前合规最佳**。flash_attn_varlen_func替代Python循环SDPA，-2.41s |
 | **torch.compile SMoE** | V142 | 270.86s | 15.84 | 1.059 | 0.097 | ❌ 灾难：动态shape重编译导致延迟6倍+AUC崩塌 |
+| **QKV permute链优化** | V143 | 47.88s | 67.87 | 1.059 | 0.752 | ❌ permute不是瓶颈，优化反而慢2s |
 
 ### ⚠️ 违规警告
 
@@ -138,6 +139,7 @@ Baidu GRAB/
 | batch_size 50→100 | 已饱和GPU→+0.36s(V140) |
 | baddbmm/einsum融合 | CUBLAS已充分融合→+0.8s(V141) |
 | torch.compile SMoE | 动态shape重编译→270s灾难+AUC崩塌(V142) |
+| QKV permute链优化 | permute不是瓶颈→反而慢2s(V143) |
 | 删除死FFN | 实现错误→+21s(V134) |
 
 ### 待探索方向（基于1000+篇文献深度调研，按优先级排序）
