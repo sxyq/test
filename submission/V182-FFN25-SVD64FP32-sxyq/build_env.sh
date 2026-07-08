@@ -22,8 +22,11 @@ else
     uv pip install -r requirements.txt --target "${LIB_DIR}" -i https://mirrors.aliyun.com/pypi/simple/ || true
 fi
 
-echo "Attempting flash-attn precompiled wheel (60s timeout)..."
-timeout 60 pip install flash-attn --no-build-isolation -f https://flash-attn.github.io/whl/ 2>/dev/null || echo "flash-attn skipped"
+echo "Attempting flash-attn precompiled wheel (300s timeout)..."
+# V138: Increase timeout to 300s for flash-attn wheel download.
+# flash-attn provides varlen API that replaces per-user SDPA loop,
+# saving ~15s latency (160 kernel launches -> 1 fused kernel per batch).
+timeout 300 pip install flash-attn --no-build-isolation -f https://flash-attn.github.io/whl/ 2>/dev/null || echo "flash-attn skipped (will use SDPA fallback)"
 
 echo "=========================================="
 echo "环境构建完成！"
