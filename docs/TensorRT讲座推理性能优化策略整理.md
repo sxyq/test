@@ -23,6 +23,100 @@
 - 把 `V169/V176` 作为结构压缩主线；
 - 把动态 shape、ONNX 导出、数值回归、profiling 流程补成一条真正可复现的验证链。
 
+## 0.1 必须补充的违规边界
+
+这份文档原本更偏“如何优化”，但要真正作为长期 `infer.py` 研究底座，还必须补上“哪些内容即使更快也不能做”。
+
+下面这组边界来自你补充的规则截图，应视为当前项目的**硬约束清单**。后续所有 profiling、TensorRT、compile、shape bucket、剪枝、量化、kernel 优化，都必须先过这一关。
+
+### 规则 1：禁止在推理路径对输入采样 / 截断
+
+以下做法都应直接判为违规：
+
+- 只跑部分 batch、subset、sampling 过的数据；
+- 用环境变量或逻辑限制 `max_batches` / `limit_batches` / 早停 batch；
+- 在 `infer` 中把 `max_ctx_len`、有效历史长度、人群数、候选数主动改小；
+- 把线上完整输入换成“更容易跑的小输入”。
+
+这条对当前项目的实际含义是：
+
+1. 不能把“本地轻量测试逻辑”搬进正式提交版 `infer.py`；
+2. 任何只跑前若干 batch 的逻辑只能存在于研究脚本里，不能出现在 submission；
+3. 动态 shape 优化的目标是**更高效地处理原输入**，不是把原输入缩小。
+
+### 规则 2：禁止结构性裁剪组网
+
+命中任一条都应判为违规：
+
+- Transformer 层数变少，例如 `< 8 layer`、ZeroLayer、直接跳层；
+- 删除或绕过完整的 attention 主路径，例如 `qkv_proj` / `out_proj` / `scaled_dot_product_attention`；
+- 删除或跳过完整的一层 SMoE，例如整层 `expert` 或 `gate` 被拿掉；
+- 改变有效 expert 数，或把 `Top-K` 从 `K=2` 改小；
+- 删除 `RepEncoder` 里的完整大层，例如大 Embedding、LayerNorm、Linear 整层缺失；
+- 直接在 forward 里写类似 `if layer_idx == 1: return x` 这种跳层捷径。
+
+这条需要特别区分两种情况：
+
+- **允许的减算量**：保持数学语义基本不变的精度、kernel、编译、layout、融合、低秩近似、受控结构压缩；
+- **不允许的减算量**：直接删层、跳层、减 K、减有效 expert、绕过主干 forward。
+
+所以后续如果继续做剪枝，也必须坚持：
+
+1. 只做**细粒度、可解释、可验证**的压缩；
+2. 不把“少算”偷偷变成“少跑整段网络”；
+3. 所有结构改动都要先问一句：是否让完整前向语义发生了离散变化。
+
+### 规则 3：禁止破坏 forward 拓扑 / 输入完整性
+
+以下行为应视为违规：
+
+- 剪枝或压缩后不再保持数学等价或近似等价；
+- 为了提速修改输入掩码语义，例如改 `slot_mask`、把合法 mask 变成更稀疏的 mask；
+- 为了提速修改 `RepEncoder` 输入语义；
+- 让 embedding 某些表、某些 slot 在没有数据驱动依据的情况下被静态跳过；
+- 用“默认置零”“默认常量”“伪造 mask/zero slot”替代真实输入处理。
+
+这条对当前 TensorRT / ONNX / compile 路线尤其重要：
+
+- 做 graph rewrite 可以；
+- 做 plugin 可以；
+- 做 operator fusion 可以；
+- 但不能因为改图方便，就把原始输入语义悄悄简化。
+
+### 规则 4：禁止 hack / 欺骗评测脚本
+
+这类行为命中任一条都应直接视为作弊：
+
+- 篡改计时，例如 monkey-patch `time`、`perf_counter`、`torch.cuda.Event`、`cuda.synchronize`；
+- 把真正应该计时的计算挪到计时区外，例如把大部分 forward 放到 `load_model` 或预处理阶段；
+- 用大规模 dummy 预热、cache 预分配等方式，实质上提前算完正式 batch；
+- 提前离线生成 `logit_cache`、`pred_cache`、`logid -> prob` 字典，再在 infer 中直接查表；
+- 用并行流、后台线程、异步 I/O 把该轮 forward 结果偷运到计时区外；
+- 直接输出静态/随机/预写好的 `predict.txt`，或用小模型替换正式模型输出。
+
+这条对后续实验的直接约束是：
+
+1. `warmup` 可以做，但必须是工程上正常的首次编译/首次 kernel 触发，不是“先替正式数据跑一遍”；
+2. cache 可以做，但只能做**不改变评测语义**的正常 runtime cache，而不是离线偷算；
+3. 任何“把计算搬出计时区”的优化，都要先默认怀疑其违规风险。
+
+### 当前鼓励的合规优化方向
+
+截图里同时明确了，下面这些方向是鼓励做的，只要不破坏前面 4 条：
+
+- 精度层：`fp16` / `bf16` / `int8` / `fp8` / `W8A8` / `W4A16`
+- 算子层：Triton / CUDA kernel、FlashAttention、PagedAttention、fused gate / MoE / MLP / LayerNorm
+- 推理层：`torch.compile`、CUDA Graph、多 stream 并行
+- 内存层：KV cache 复用、预分配、pinned memory、零拷贝
+- 调度层：batch grouping、padding 优化、pack / varlen attention、动态 batch
+- MoE 层：expert grouped GEMM、topk 优化、expert 并行（前提是有效 expert 数和 `K=2` 不变）
+- I/O 层：异步加载、prefetch、`predict` batch 重排
+- 低改等价重写：A/B fused、权重预处理等
+
+所以这份文档后面的所有“建议”，都应默认理解成：
+
+**在不碰违规红线的前提下，尽可能把同一份完整 forward 跑得更快。**
+
 ## 1. 图片顺序与审核口径
 
 本次共收到 15 张图片，其中 **第 10 张与第 8 张为重复页**，所以实际按 **14 个唯一页面** 处理。
@@ -716,6 +810,93 @@
    - PTQ / QAT
    - plugin
    - 原生 TensorRT network API
+
+### 3.4 当前已经落实到版本里的内容
+
+到 `V185-V177-STACKED-SUBMIT-sxyq` 为止，这份策略文档里已经被真正落实的优化，不再只是“建议”，而是已经进入正式 submission 主线：
+
+1. **结构减算优先，而不是删层/跳层**
+   - 采用 `FFN prune25 + SVD rank64`
+   - 属于受控结构压缩，不是违规的跳层、减层、减 `Top-K`
+
+2. **先修校准，再谈速度**
+   - 采用基于线上锚点的 `logit bias recalibration`
+   - 证明结构压缩后的主要风险之一确实是常数级校准漂移
+
+3. **动态 shape 下优先选择更稳的 compile 路线**
+   - 默认 `torch.compile(mode=max-autotune-no-cudagraphs, dynamic=True)`
+   - 并保留 warmup fallback，而不是强行押注脆弱的 cudagraph
+
+4. **把热点模块而不是全模型纳入编译**
+   - `seq_encoder` 继续编译
+   - `rep_encoder` 也进入可控 compile 范围
+   - 输出头保持 eager，避免为小模块付出无意义编译开销
+
+5. **运行时搬运与输入管线继续收敛**
+   - CUDA 路径启用 `pin_memory`
+   - 属于文档里明确鼓励的 I/O / 内存层优化
+
+6. **SVD 构建路径做数值稳定化**
+   - 分解在 `FP32` 中完成，再 cast 回目标 dtype
+   - 这不是改图捷径，而是为了降低低精度分解的数值风险
+
+7. **I/O 层的异步 prefetch 已进入候选实现**
+   - 在 `V186-ASYNC-PREFETCH-sxyq` 中，增加了基于 CUDA stream 的 batch 预取
+   - 目标是把 `non_blocking` H2D 与当前 batch 计算重叠
+   - 这正对应文档里鼓励的 `async loading / prefetch / runtime overlap`
+   - 但线上结果已经说明：**实现合规不等于收益成立**，当前官方环境下这条线没有跑赢 `V185`
+
+8. **shape bucket 目前仍是“待验证方向”，没有默认写死进主线**
+   - 原因不是这条建议不对，而是当前代码路径已经是 `varlen` attention，不是重 padding 路径
+   - 在这条实现里，若只按用户长度强行重排 batch，未必会自然改善 `total_tokens` 形状收敛
+   - 所以这部分下一步应先做 batch-shape 统计与 compile 证据，而不是直接默认打开
+
+9. **batch grouping / predict batch 重排 已进入候选实现**
+   - 在 `V187-BALANCED-BATCH-sxyq` 中，不改变 `50 user/batch` 上限，只重排“哪些用户被分到同一批”
+   - 目标不是减少样本，而是拉平每批 `total_tokens`
+   - 本地小样本统计里，这条线已经把 `batch token std` 从 `102.97` 压到 `38.88`
+   - 但线上结果 `69.85911 / 39.33983s / 0.75649 / 1.06429` 说明它没有超过 `V185`
+   - 后续进一步核对代码路径后确认：如果线上目录里存在 `cached_batches/shard_*.pt`，原版 `V187` 仍会优先命中缓存分支，`Dataset/make_collate_fn` 里的 batch 重排不一定真正进入执行路径
+
+10. **线上 batch 组织优化必须先拿回执行路径控制权**
+   - 因为 `cached_batches` 会绕过 `CSV -> Dataset -> DataLoader -> make_collate_fn`
+   - 所以新增 `V188-FORCE-DATALOADER-sxyq`，默认忽略 `cached_batches`，强制走自建 batch 路径
+   - 线上结果 `70.00710 / 38.70555s / 0.75649 / 1.06429` 说明这一步不是空修复：拿回执行路径后，`V187` 的调度层收益确实开始显现
+   - 但它仍然没有超过 `V185`，说明仅靠“强制走 DataLoader”还不够，后续必须继续补 `shape bucket + runtime overlap`
+
+11. **下一步必须把 shape 治理和 runtime overlap 合并验证**
+   - 因为 `V188` 已经证明 dataset/collate 路径重新生效
+   - 所以继续新增 `V189-BUCKET-PREFETCH-sxyq`：
+     - batch 仍保持 `50 user/batch`
+     - 先按 `token_total` / `max_len` 做更紧的 batch 顺序治理
+     - 再把 median-size batch 放到 warmup 起点附近，降低 compile 首批形状偏置
+     - 同时把 CUDA async prefetch 接回这条已生效的 DataLoader 路径
+   - 这一步对应的正是文档前面强调的：`shape bucket + 预热` 优先级高于继续盲目押注单点 compile 开关
+
+12. **本地轻量验证已经说明：shape 治理不能乱重排**
+   - 在 `V189` 的本地代理对比里，median-first 重排会明显破坏相邻 batch 的 `max_len` 连续性
+   - 因此继续新增 `V190-SHAPE-STABLE-sxyq`：
+     - 保留 `V188` 的 forced DataLoader 路径
+     - 保留 balanced batching
+     - 但把 batch 执行顺序显式固定为 `max_len` / `token_total` 优先的 shape-stable 顺序
+     - 不再默认叠加 `V189` 的 median-first 重排与 prefetch
+   - 这更符合文档前面反复强调的原则：先保证真实执行路径和 shape 连续性，再讨论 runtime overlap
+
+13. **`V190` 进一步改成激进的端到端 CPU batch 构造优化版**
+   - 在不改变模型结构、不改变输入规模、不截断、不采样的前提下，把还能安全落地的工程项继续压进 `V190`
+   - 默认开启：
+     - `GRAB_V188_USE_CACHED_BATCHES=0`：强制走 `CSV -> Dataset -> DataLoader -> make_collate_fn`
+     - `GRAB_V190_SHAPE_STABLE_BATCH_ORDER=1`：固定 `max_len` / `token_total` 优先的 batch 执行顺序
+     - `GRAB_V190_PRECOMPUTE_USER_RECORDS=1`：在 Dataset 初始化阶段预先完成用户内排序、`pred_mask` 构造和 record 汇总，避免 `__getitem__` 重复排序
+     - `GRAB_V190_FAST_COLLATE=1`：重写 collate 聚合路径，减少 Python 层逐字段拼接和重复 membership 检查
+   - 同时把 `max_sign_id` 统计合并进加载主循环，去掉原先构造 Dataset 后再扫一遍全部 sign 的额外 pass
+   - 本地轻量验证结果：
+     - `python3 -m py_compile submission/V190-SHAPE-STABLE-sxyq/infer.py` 通过
+     - 默认开关检查为 `cache=False / shape_order=True / precompute=True / fast_collate=True`
+     - 与 `V188` 首个 DataLoader batch 做 `userid/logid/label/pred_mask/user_offsets/1..28 slots` 共 33 项对齐，无 mismatch
+     - 同一本地样本的 DataLoader 代理迭代从 `V188 6.4470s` 降到 `V190 4.3831s`，覆盖 `20` 个 batch、`296284` 条样本
+   - 这部分属于端到端链路里的 CPU 输入管线优化，不是模型近似压缩，也不是评测路径规避
+   - 但需要明确：该收益只是本地轻量代理数据，最终是否能压低线上 `38.7s` 级 latency 仍需正式提交确认
 
 ## 4. 官方资料索引
 
