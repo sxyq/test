@@ -1,0 +1,2 @@
+submission/**/libnvinfer.so.10 filter=lfs diff=lfs merge=lfs -text
+submission/**/libbaidu_moe_top2_plugin.so filter=lfs diff=lfs merge=lfs -text

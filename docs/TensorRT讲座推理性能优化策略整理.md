@@ -20,7 +20,8 @@
 对当前 GRAB 项目最有价值的不是“现在就全量上 TensorRT”，而是：
 
 - 把 `V139` 作为 attention 对照主线；
-- 把 `V169/V176` 作为结构压缩主线；
+- 把 `V194` 作为 `plugin + runtime` 主线；
+- 把 `V185/V176` 作为结构压缩参考主线；
 - 把动态 shape、ONNX 导出、数值回归、profiling 流程补成一条真正可复现的验证链。
 
 ## 0.1 必须补充的违规边界
@@ -793,27 +794,28 @@
 
 ### 3.3 对 GRAB 的最终落地顺序
 
-结合本地版本现状，最务实的顺序仍然是：
+结合本地版本现状，最务实的顺序已经更新为双轨：
 
 1. 用 `V139` 做 attention 主线对照
-2. 用 `V169 / V176` 做结构压缩主线
-3. 先做：
+2. 用 `V194` 做 TRT-MoE plugin 主线
+3. 用 `V185 / V176` 做结构压缩参考主线
+4. 先做：
    - shape 分布统计
    - profiling
    - PyTorch -> ONNX 导出
    - ORT / TRT 数值回归
-4. 再做：
+5. 再做：
    - FP16 TensorRT baseline
    - timing cache
    - profile 配置
-5. 最后才讨论：
+6. 最后才讨论：
    - PTQ / QAT
-   - plugin
+   - plugin 深改
    - 原生 TensorRT network API
 
 ### 3.4 当前已经落实到版本里的内容
 
-到 `V185-V177-STACKED-SUBMIT-sxyq` 为止，这份策略文档里已经被真正落实的优化，不再只是“建议”，而是已经进入正式 submission 主线：
+到 `V195-TRT-MOE-HIGHRISK-sxyq` 为止，这份策略文档里已经被真正落实的优化，不再只是“建议”，而是已经进入正式 submission 版本竞争：
 
 1. **结构减算优先，而不是删层/跳层**
    - 采用 `FFN prune25 + SVD rank64`
@@ -895,8 +897,27 @@
      - 默认开关检查为 `cache=False / shape_order=True / precompute=True / fast_collate=True`
      - 与 `V188` 首个 DataLoader batch 做 `userid/logid/label/pred_mask/user_offsets/1..28 slots` 共 33 项对齐，无 mismatch
      - 同一本地样本的 DataLoader 代理迭代从 `V188 6.4470s` 降到 `V190 4.3831s`，覆盖 `20` 个 batch、`296284` 条样本
-   - 这部分属于端到端链路里的 CPU 输入管线优化，不是模型近似压缩，也不是评测路径规避
-   - 但需要明确：该收益只是本地轻量代理数据，最终是否能压低线上 `38.7s` 级 latency 仍需正式提交确认
+   - 线上反馈：`V190` 得分约 `69.5`，反而低于 `V188` 和 `V185`
+   - 因此该版本应归为反证样本，而不是晋级主线：
+     - 本地 CPU DataLoader 代理收益不能直接等同于线上端到端收益
+     - 预计算与 fast collate 可能降低迭代器局部耗时，但未必改善正式计时区里的总链路
+     - shape-stable 排序也可能没有命中 CUDA 前向真正受益的 shape 序列
+   - 后续若继续做输入管线优化，必须同时报告：
+     - 数据加载总耗时
+     - 首批 warmup 与正式计时分界
+
+14. **`V194` 证明 TRT-MoE plugin 主链路已经成为当前最高 ROI 主线**
+   - 线上结果：`70.95097 / 34.66039s / 0.75261 / 1.05895`
+   - 它不是“再做一版结构压缩”，而是保留外部 `70.65518` 包里的 `TensorRT MoE plugin + RepEncoder count-matmul + token_cap grouping` 主链路，只叠加低冲突壳层优化
+   - 这说明当前最值得继续压榨的，不再是纯 PyTorch 结构叠加，而是 `plugin + runtime + build-time` 这条 TRT 主线
+
+15. **`V195` 证明 TRT 主链路上的高风险变量不能简单硬叠**
+   - 线上结果：`70.48002 / 35.01999s / 0.75271 / 0.86655`
+   - 相比 `V194`，虽然 AUC 略高，但 PCOC 被明显压低，score_all 反而回退
+   - 这说明 `force-dataloader + balanced batching + plugin-side FFN prune + 额外 bias` 这组变量在 TRT 主链路上至少不能作为默认整组叠加
+   - 后续应把 `V195` 当成高风险反证样本，拆回单变量验证，而不是继续作为默认底座加更多变量
+     - 每批 `max_len / token_total / pred_count`
+     - 模型 forward 计时，而不能只看 DataLoader 代理迭代
 
 ## 4. 官方资料索引
 
